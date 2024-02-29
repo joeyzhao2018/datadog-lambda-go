@@ -63,7 +63,7 @@ func contextWithRootTraceContext(ctx context.Context, ev json.RawMessage, mergeX
 	}
 
 	if !mergeXrayTraces {
-		logger.Debug("Merge X-Ray Traces is off, using trace context from Datadog only")
+		logger.Debug("THIS IS CHANGED NOW")
 		return context.WithValue(ctx, traceContextKey, datadogTraceContext), nil
 	}
 

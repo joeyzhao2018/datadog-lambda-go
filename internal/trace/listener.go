@@ -19,9 +19,13 @@ import (
 	"github.com/DataDog/datadog-lambda-go/internal/logger"
 	"github.com/DataDog/datadog-lambda-go/internal/version"
 	"github.com/aws/aws-lambda-go/lambdacontext"
+	"go.opentelemetry.io/otel"
 	"gopkg.in/DataDog/dd-trace-go.v1/ddtrace"
+	ddotel "gopkg.in/DataDog/dd-trace-go.v1/ddtrace/opentelemetry"
 	"gopkg.in/DataDog/dd-trace-go.v1/ddtrace/tracer"
+	ddtracer "gopkg.in/DataDog/dd-trace-go.v1/ddtrace/tracer"
 )
+
 
 type (
 	// Listener creates a function execution span and injects it into the context
@@ -29,6 +33,7 @@ type (
 		ddTraceEnabled           bool
 		mergeXrayTraces          bool
 		universalInstrumentation bool
+		otelTracerEnabled 		 bool
 		extensionManager         *extension.ExtensionManager
 		traceContextExtractor    ContextExtractor
 	}
@@ -38,6 +43,7 @@ type (
 		DDTraceEnabled           bool
 		MergeXrayTraces          bool
 		UniversalInstrumentation bool
+		OtelTracerEnabled 		 bool
 		TraceContextExtractor    ContextExtractor
 	}
 )
@@ -54,6 +60,7 @@ func MakeListener(config Config, extensionManager *extension.ExtensionManager) L
 		ddTraceEnabled:           config.DDTraceEnabled,
 		mergeXrayTraces:          config.MergeXrayTraces,
 		universalInstrumentation: config.UniversalInstrumentation,
+		otelTracerEnabled:		  config.OtelTracerEnabled,
 		extensionManager:         extensionManager,
 		traceContextExtractor:    config.TraceContextExtractor,
 	}
@@ -76,12 +83,25 @@ func (l *Listener) HandlerStarted(ctx context.Context, msg json.RawMessage) cont
 		if serviceName == "" {
 			serviceName = "aws.lambda"
 		}
-		tracer.Start(
-			tracer.WithService(serviceName),
-			tracer.WithLambdaMode(!l.extensionManager.IsExtensionRunning()),
-			tracer.WithGlobalTag("_dd.origin", "lambda"),
-			tracer.WithSendRetries(2),
-		)
+		extensionNotRunning := !l.extensionManager.IsExtensionRunning()
+		if l.otelTracerEnabled {
+			logger.Debug(fmt.Sprintf("OTEL TRACER INITIALIZED WITH SERVICE NAME: %s", serviceName))
+			provider := ddotel.NewTracerProvider(
+				ddtracer.WithService("aws.lambda"),
+				ddtracer.WithLambdaMode(true),
+				ddtracer.WithGlobalTag("_dd.origin","lambda"),
+				ddtracer.WithSendRetries(2),
+			)
+			otel.SetTracerProvider(provider)
+		} else {
+			ddtracer.Start(
+				ddtracer.WithService(serviceName),
+				ddtracer.WithLambdaMode(extensionNotRunning),
+				ddtracer.WithGlobalTag("_dd.origin", "lambda"),
+				ddtracer.WithSendRetries(2),
+			)
+		}
+
 		tracerInitialized = true
 	}
 
@@ -89,7 +109,7 @@ func (l *Listener) HandlerStarted(ctx context.Context, msg json.RawMessage) cont
 	functionExecutionSpan, ctx = startFunctionExecutionSpan(ctx, l.mergeXrayTraces, isDdServerlessSpan)
 
 	// Add the span to the context so the user can create child spans
-	ctx = tracer.ContextWithSpan(ctx, functionExecutionSpan)
+	ctx = ddtracer.ContextWithSpan(ctx, functionExecutionSpan)
 
 	return ctx
 }
@@ -97,14 +117,14 @@ func (l *Listener) HandlerStarted(ctx context.Context, msg json.RawMessage) cont
 // HandlerFinished ends the function execution span and stops the tracer
 func (l *Listener) HandlerFinished(ctx context.Context, err error) {
 	if functionExecutionSpan != nil {
-		functionExecutionSpan.Finish(tracer.WithError(err))
+		functionExecutionSpan.Finish(ddtracer.WithError(err))
 
 		if l.universalInstrumentation && l.extensionManager.IsExtensionRunning() {
 			l.extensionManager.SendEndInvocationRequest(ctx, functionExecutionSpan, err)
 		}
 	}
 
-	tracer.Flush()
+	ddtracer.Flush()
 }
 
 // startFunctionExecutionSpan starts a span that represents the current Lambda function execution
@@ -133,21 +153,39 @@ func startFunctionExecutionSpan(ctx context.Context, mergeXrayTraces bool, isDdS
 		// The extension will drop this span, prioritizing the execution span the extension creates
 		resourceName = string(extension.DdSeverlessSpan)
 	}
+	var span ddtracer.Span
+	// if otelTracerEnabled {
+	// 	span = otel.Tracer("datadog-lambda-go").Start(ddotel.ContextWithStartOptions(
+	// 		ctx,
+	// 		ddtracer.SpanType("serverless"),
+	// 		ddtracer.ChildOf(parentSpanContext),
+	// 		ddtracer.ResourceName(resourceName),
+	// 		ddtracer.Tag("cold_start", ctx.Value("cold_start")),
+	// 		ddtracer.Tag("function_arn", functionArn),
+	// 		ddtracer.Tag("function_version", functionVersion),
+	// 		ddtracer.Tag("request_id", lambdaCtx.AwsRequestID),
+	// 		ddtracer.Tag("resource_names", lambdacontext.FunctionName),
+	// 		ddtracer.Tag("functionname", strings.ToLower(lambdacontext.FunctionName)),
+	// 		ddtracer.Tag("datadog_lambda", version.DDLambdaVersion),
+	// 		ddtracer.Tag("dd_trace", version.DDTraceVersion),
+	// 	), "aws.lambda")
+	// } else {
+		span = ddtracer.StartSpan(
+			"aws.lambda", // This operation name will be replaced with the value of the service tag by the Forwarder
+			ddtracer.SpanType("serverless"),
+			ddtracer.ChildOf(parentSpanContext),
+			ddtracer.ResourceName(resourceName),
+			ddtracer.Tag("cold_start", ctx.Value("cold_start")),
+			ddtracer.Tag("function_arn", functionArn),
+			ddtracer.Tag("function_version", functionVersion),
+			ddtracer.Tag("request_id", lambdaCtx.AwsRequestID),
+			ddtracer.Tag("resource_names", lambdacontext.FunctionName),
+			ddtracer.Tag("functionname", strings.ToLower(lambdacontext.FunctionName)),
+			ddtracer.Tag("datadog_lambda", version.DDLambdaVersion),
+			ddtracer.Tag("dd_trace", version.DDTraceVersion),
+		)
+	// }
 
-	span := tracer.StartSpan(
-		"aws.lambda", // This operation name will be replaced with the value of the service tag by the Forwarder
-		tracer.SpanType("serverless"),
-		tracer.ChildOf(parentSpanContext),
-		tracer.ResourceName(resourceName),
-		tracer.Tag("cold_start", ctx.Value("cold_start")),
-		tracer.Tag("function_arn", functionArn),
-		tracer.Tag("function_version", functionVersion),
-		tracer.Tag("request_id", lambdaCtx.AwsRequestID),
-		tracer.Tag("resource_names", lambdacontext.FunctionName),
-		tracer.Tag("functionname", strings.ToLower(lambdacontext.FunctionName)),
-		tracer.Tag("datadog_lambda", version.DDLambdaVersion),
-		tracer.Tag("dd_trace", version.DDTraceVersion),
-	)
 
 	if parentSpanContext != nil && mergeXrayTraces {
 		// This tag will cause the Forwarder to drop the span (to avoid redundancy with X-Ray)
